@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+  && apt-get upgrade -y \  
   && rm -rf /var/lib/apt/lists/* \
   && groupadd --gid 10001 appuser \
   && useradd --uid 10001 --gid appuser --home-dir /app --no-create-home appuser \
