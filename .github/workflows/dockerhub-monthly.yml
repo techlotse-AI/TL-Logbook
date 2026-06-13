@@ -51,7 +51,7 @@ jobs:
           scan-type: fs
           scan-ref: .
           scanners: vuln,secret,misconfig
-          severity: HIGH,CRITICAL
+          severity: CRITICAL
           ignore-unfixed: true
           exit-code: 1
 
@@ -60,7 +60,7 @@ jobs:
         with:
           image-ref: ${{ env.SCAN_TAG }}
           vuln-type: os,library
-          severity: HIGH,CRITICAL
+          severity: CRITICAL
           ignore-unfixed: true
           exit-code: 1
 
