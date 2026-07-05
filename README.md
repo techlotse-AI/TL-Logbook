@@ -1,8 +1,8 @@
 # TL-Logbook-Dashboard
 
-[![Container Build](https://github.com/techlotse/TL-Logbook-Dashboard/actions/workflows/dockerhub-monthly.yml/badge.svg)](https://github.com/techlotse/TL-Logbook-Dashboard/actions/workflows/dockerhub-monthly.yml)
-[![Security Scan](https://github.com/techlotse/TL-Logbook-Dashboard/actions/workflows/security-scan.yml/badge.svg)](https://github.com/techlotse/TL-Logbook-Dashboard/actions/workflows/security-scan.yml)
-[![Latest Version](https://img.shields.io/badge/latest-v1.0.0-00D1C7)](https://github.com/techlotse/TL-Logbook-Dashboard/releases/tag/v1.0.0)
+[![Container Build](https://github.com/techlotse-AI/TL-Logbook/actions/workflows/dockerhub-monthly.yml/badge.svg)](https://github.com/techlotse-AI/TL-Logbook/actions/workflows/dockerhub-monthly.yml)
+[![Security Scan](https://github.com/techlotse-AI/TL-Logbook/actions/workflows/security-scan.yml/badge.svg)](https://github.com/techlotse-AI/TL-Logbook/actions/workflows/security-scan.yml)
+[![Latest Version](https://img.shields.io/badge/latest-v1.1.0-00D1C7)](https://github.com/techlotse-AI/TL-Logbook/releases/latest)
 [![Docker Hub](https://img.shields.io/badge/docker-techlotse%2Ftl--logbook--dashboard-2496ED?logo=docker)](https://hub.docker.com/r/techlotse/tl-logbook-dashboard)
 
 Dark-mode FOCA logbook dashboard for uploaded PDF exports.
@@ -46,8 +46,8 @@ Upload a FOCA PDF from the page. Each browser session gets its own private serve
 Use this when deploying from a cloned repository:
 
 ```bash
-git clone https://github.com/techlotse/TL-Logbook-Dashboard.git
-cd TL-Logbook-Dashboard
+git clone https://github.com/techlotse-AI/TL-Logbook.git
+cd TL-Logbook
 cp .env.example .env
 docker compose up -d
 ```
@@ -140,7 +140,7 @@ Set these GitHub repository secrets:
 
 The Dockerfile uses `python:slim` rather than a pinned base tag. The scheduled build uses `pull: true` and no cache so the image picks up current upstream base-image security updates on each monthly run.
 
-Before Docker Hub login and push, the workflow builds a local image and runs Trivy against both the repository and container image. The publish job fails on fixable `HIGH` or `CRITICAL` vulnerabilities, secret findings, or configuration misconfigurations.
+Before Docker Hub login and push, the workflow builds a local image and runs Trivy against both the repository and container image. The publish job fails on fixable `CRITICAL` vulnerabilities, secret findings, or configuration misconfigurations.
 
 ## Container Security
 
@@ -159,7 +159,7 @@ The workflow scans:
 - A freshly built local container image
 - The published `docker.io/techlotse/tl-logbook-dashboard:latest` image on scheduled/manual runs
 
-Reports are uploaded as GitHub Actions artifacts for 30 days. The default policy fails on fixable `HIGH` and `CRITICAL` findings while ignoring unfixed vulnerabilities to avoid blocking on issues with no upstream remediation.
+Reports are uploaded as GitHub Actions artifacts for 30 days and cover both `HIGH` and `CRITICAL` findings. The enforcement gate fails the build only on fixable `CRITICAL` findings, while ignoring unfixed vulnerabilities to avoid blocking on issues with no upstream remediation.
 
 Run equivalent local checks before pushing:
 
@@ -171,14 +171,19 @@ trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 techlotse/tl
 
 ## Release
 
-Current version: `v1.0.0`
+Current version: `v1.1.0`
 
-Recommended first release:
+Releases are cut by pushing a semver tag. Update `VERSION` and `CHANGELOG.md`, then:
 
 ```bash
-git tag v1.0.0
+git tag v1.1.0
 git push origin main --tags
 ```
+
+Pushing a `v*.*.*` tag triggers two workflows automatically:
+
+- `release.yml` publishes a GitHub release with generated notes.
+- `dockerhub-monthly.yml` builds, scans, and pushes the matching Docker Hub tags.
 
 ## License
 

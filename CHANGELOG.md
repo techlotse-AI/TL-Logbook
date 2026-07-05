@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.0 - 2026-07-05
+
+- Improved PDF parser performance.
+- Improved Docker Compose example.
+- Hardened the Dockerfile with base-image package upgrades.
+- Tightened the Trivy publish gate to fail only on fixable `CRITICAL` findings.
+
 ## v1.0.0 - 2026-05-01
 
 Initial GitHub-ready release.
