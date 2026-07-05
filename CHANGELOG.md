@@ -6,6 +6,7 @@
 - Improved Docker Compose example.
 - Hardened the Dockerfile with base-image package upgrades.
 - Tightened the Trivy publish gate to fail only on fixable `CRITICAL` findings.
+- Bumped `python-multipart` to 0.0.32 and `PyMuPDF` to 1.26.7 to clear Dependabot security advisories (DoS, parameter smuggling, path traversal).
 
 ## v1.0.0 - 2026-05-01
 
