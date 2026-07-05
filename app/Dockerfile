@@ -2,7 +2,7 @@ FROM python:slim
 
 LABEL org.opencontainers.image.title="TL-Logbook-Dashboard" \
       org.opencontainers.image.description="Session-isolated FOCA logbook analytics dashboard" \
-      org.opencontainers.image.source="https://github.com/techlotse/TL-Logbook-Dashboard" \
+      org.opencontainers.image.source="https://github.com/techlotse-AI/TL-Logbook" \
       org.opencontainers.image.licenses="Personal-Use-Only"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
