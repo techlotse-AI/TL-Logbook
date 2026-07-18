@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.0 - 2026-07-18
+
+- Updated all Python dependencies to their latest releases: `fastapi` 0.139.2, `uvicorn` 0.51.0, `PyMuPDF` 1.28.0, `pdfplumber` 0.11.10 (`airportsdata` 20260315 and `python-multipart` 0.0.32 already current).
+- Updated Docker workflow actions to their latest majors: `docker/login-action` v4, `docker/build-push-action` v7, `docker/metadata-action` v6, `docker/setup-buildx-action` v4, `docker/setup-qemu-action` v4.
+- Completed a security and performance audit; findings tracked in issues #17–#24.
+
 ## v1.1.0 - 2026-07-05
 
 - Improved PDF parser performance.
