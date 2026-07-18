@@ -1,4 +1,4 @@
-FROM python:slim
+FROM python:3.14-slim
 
 LABEL org.opencontainers.image.title="TL-Logbook-Dashboard" \
       org.opencontainers.image.description="Session-isolated FOCA logbook analytics dashboard" \
