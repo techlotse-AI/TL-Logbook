@@ -165,14 +165,15 @@ def extract_owner(pdf: pdfplumber.PDF) -> str:
 
 def group_word_lines(words: list[tuple[Any, ...]], tolerance: float = 2.0) -> list[list[tuple[Any, ...]]]:
     lines: list[list[tuple[Any, ...]]] = []
+    line_y_sums: list[float] = []
     for word in sorted(words, key=lambda item: (float(item[1]), float(item[0]))):
         y0 = float(word[1])
-        if lines:
-            line_y = sum(float(item[1]) for item in lines[-1]) / len(lines[-1])
-            if abs(y0 - line_y) <= tolerance:
-                lines[-1].append(word)
-                continue
+        if lines and abs(y0 - line_y_sums[-1] / len(lines[-1])) <= tolerance:
+            lines[-1].append(word)
+            line_y_sums[-1] += y0
+            continue
         lines.append([word])
+        line_y_sums.append(y0)
     return lines
 
 
@@ -654,8 +655,30 @@ def parse_pdf_to_summary(pdf_path: Path, source_filename: str = "", progress_cal
 
 if __name__ == "__main__":
     import argparse
+    import sys
 
-    parser = argparse.ArgumentParser(description="Parse a FOCA logbook PDF and print dashboard JSON.")
+    parser = argparse.ArgumentParser(description="Parse a FOCA logbook PDF and emit dashboard JSON.")
     parser.add_argument("pdf", type=Path)
+    parser.add_argument("--output", type=Path, default=None, help="Write the summary JSON to this file instead of stdout.")
+    parser.add_argument("--source-filename", default="", help="Original upload filename recorded in the summary meta.")
+    parser.add_argument("--progress", action="store_true", help="Emit 'PROGRESS <page> <total>' lines on stdout while parsing.")
     args = parser.parse_args()
-    print(json.dumps(parse_pdf_to_summary(args.pdf, source_filename=args.pdf.name), indent=2))
+
+    def emit_progress(page_number: int, total_pages: int) -> None:
+        print(f"PROGRESS {page_number} {total_pages}", flush=True)
+
+    try:
+        summary = parse_pdf_to_summary(
+            args.pdf,
+            source_filename=args.source_filename or args.pdf.name,
+            progress_callback=emit_progress if args.progress else None,
+        )
+    except ValueError as exc:
+        # Exit code 3 marks a user-facing parse rejection; the message is safe to relay.
+        print(f"ERROR: {exc}", flush=True)
+        sys.exit(3)
+
+    if args.output:
+        args.output.write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+    else:
+        print(json.dumps(summary, indent=2))

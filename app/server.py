@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import json
+import logging
 import os
 import re
 import secrets
 import shutil
+import subprocess
+import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -16,18 +24,48 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from logbook_parser import parse_pdf_to_summary
 
+logger = logging.getLogger("tl_logbook")
 
 APP_DIR = Path(__file__).parent
 STATIC_DIR = APP_DIR / "static"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 SESSION_ROOT = DATA_DIR / "sessions"
 COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "tl_logbook_session")
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "auto").lower()
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(24 * 60 * 60)))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))
+PARSE_TIMEOUT_SECONDS = int(os.getenv("PARSE_TIMEOUT_SECONDS", "120"))
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "500"))
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600"))
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{24,96}$")
+
+GENERIC_PARSE_ERROR = "Could not process this PDF as a FOCA logbook export."
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' https://unpkg.com; "
+        "style-src 'self' https://unpkg.com 'unsafe-inline'; "
+        "img-src 'self' data: https://unpkg.com https://*.basemaps.cartocdn.com; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    ),
+}
+
+INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+LEGAL_HTML = (STATIC_DIR / "legal.html").read_text(encoding="utf-8")
+
+
+class ParseError(ValueError):
+    """A parse failure whose message is safe to show to the client."""
 
 
 @dataclass
@@ -45,11 +83,9 @@ class SessionState:
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
-app = FastAPI(title="TL-Logbook-Dashboard")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 _sessions: dict[str, SessionState] = {}
 _sessions_lock = threading.RLock()
+_cleanup_task: asyncio.Task | None = None
 
 
 def now() -> float:
@@ -64,6 +100,55 @@ def valid_session_id(value: str | None) -> bool:
     return bool(value and SESSION_ID_RE.fullmatch(value))
 
 
+@lru_cache(maxsize=1)
+def session_secret() -> bytes:
+    env_secret = os.getenv("SESSION_SECRET", "")
+    if env_secret:
+        return env_secret.encode("utf-8")
+    path = DATA_DIR / ".session_secret"
+    try:
+        data = path.read_bytes().strip()
+        if len(data) >= 32:
+            return data
+    except OSError:
+        pass
+    secret = secrets.token_hex(32).encode("ascii")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(secret)
+    return secret
+
+
+def sign_session_id(session_id: str) -> str:
+    return hmac.new(session_secret(), session_id.encode("ascii"), hashlib.sha256).hexdigest()[:32]
+
+
+def cookie_value(session_id: str) -> str:
+    return f"{session_id}.{sign_session_id(session_id)}"
+
+
+def session_id_from_cookie(value: str | None) -> str | None:
+    # Only honor IDs this server issued: the cookie carries "<id>.<hmac>".
+    if not value or "." not in value:
+        return None
+    session_id, _, signature = value.rpartition(".")
+    if not valid_session_id(session_id):
+        return None
+    if not hmac.compare_digest(sign_session_id(session_id), signature):
+        return None
+    return session_id
+
+
+def cookie_secure_flag(request: Request) -> bool:
+    if COOKIE_SECURE == "true":
+        return True
+    if COOKIE_SECURE == "false":
+        return False
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return proto == "https"
+
+
 def session_dir(session_id: str) -> Path:
     if not valid_session_id(session_id):
         raise ValueError("Invalid session id")
@@ -72,6 +157,13 @@ def session_dir(session_id: str) -> Path:
 
 def summary_path(session_id: str) -> Path:
     return session_dir(session_id) / "summary.json"
+
+
+def count_session_dirs() -> int:
+    try:
+        return sum(1 for path in SESSION_ROOT.iterdir() if path.is_dir())
+    except OSError:
+        return 0
 
 
 def empty_dashboard_summary() -> dict[str, Any]:
@@ -164,10 +256,16 @@ def status_payload(state: SessionState) -> dict[str, Any]:
 
 def cleanup_expired_sessions() -> None:
     cutoff = now() - SESSION_TTL_SECONDS
+    # With the parse timeout a session cannot legitimately stay "processing"
+    # much longer than PARSE_TIMEOUT_SECONDS; anything older is stuck.
+    stuck_cutoff = now() - (PARSE_TIMEOUT_SECONDS + 300)
     with _sessions_lock:
         for session_id, state in list(_sessions.items()):
-            if state.updated_at < cutoff and state.status != "processing":
-                _sessions.pop(session_id, None)
+            if state.updated_at >= cutoff:
+                continue
+            if state.status == "processing" and state.updated_at >= stuck_cutoff:
+                continue
+            _sessions.pop(session_id, None)
 
     SESSION_ROOT.mkdir(parents=True, exist_ok=True)
     for path in SESSION_ROOT.iterdir():
@@ -180,34 +278,55 @@ def cleanup_expired_sessions() -> None:
             pass
 
 
+async def _cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(cleanup_expired_sessions)
+        except Exception:
+            logger.exception("Periodic session cleanup failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _cleanup_task
+    SESSION_ROOT.mkdir(parents=True, exist_ok=True)
+    session_secret()
+    await asyncio.to_thread(cleanup_expired_sessions)
+    _cleanup_task = asyncio.create_task(_cleanup_loop())
+    yield
+    _cleanup_task.cancel()
+
+
+app = FastAPI(title="TL-Logbook-Dashboard", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 @app.middleware("http")
 async def session_middleware(request: Request, call_next):
-    session_id = request.cookies.get(COOKIE_NAME)
+    session_id = session_id_from_cookie(request.cookies.get(COOKIE_NAME))
     should_set_cookie = False
-    if not valid_session_id(session_id):
+    if not session_id:
         session_id = new_session_id()
         should_set_cookie = True
 
     request.state.session = get_or_create_session(session_id)
     response = await call_next(request)
 
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+
     if should_set_cookie:
         response.set_cookie(
             COOKIE_NAME,
-            session_id,
+            cookie_value(session_id),
             max_age=SESSION_TTL_SECONDS,
             httponly=True,
             samesite="lax",
-            secure=False,
+            secure=cookie_secure_flag(request),
             path="/",
         )
     return response
-
-
-@app.on_event("startup")
-def startup() -> None:
-    SESSION_ROOT.mkdir(parents=True, exist_ok=True)
-    cleanup_expired_sessions()
 
 
 @app.get("/health", response_class=PlainTextResponse)
@@ -222,12 +341,12 @@ def favicon() -> Response:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    return INDEX_HTML
 
 
 @app.get("/legal", response_class=HTMLResponse)
 def legal() -> str:
-    return (STATIC_DIR / "legal.html").read_text(encoding="utf-8")
+    return LEGAL_HTML
 
 
 @app.get("/api/status")
@@ -245,28 +364,80 @@ def dashboard(request: Request) -> dict[str, Any]:
     return empty_dashboard_summary()
 
 
+def run_parser_subprocess(state: SessionState, pdf_path: Path, out_path: Path, filename: str) -> None:
+    # Parse in a disposable child process: a crafted PDF cannot pin this
+    # process's CPU past the timeout or reach other sessions' data on exploit.
+    command = [
+        sys.executable,
+        str(APP_DIR / "logbook_parser.py"),
+        str(pdf_path),
+        "--output",
+        str(out_path),
+        "--source-filename",
+        filename,
+        "--progress",
+    ]
+    timed_out = threading.Event()
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(APP_DIR),
+    )
+
+    def kill_on_timeout() -> None:
+        timed_out.set()
+        proc.kill()
+
+    killer = threading.Timer(PARSE_TIMEOUT_SECONDS, kill_on_timeout)
+    killer.start()
+    user_error = ""
+    diagnostics: list[str] = []
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("PROGRESS "):
+                parts = line.split()
+                if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                    page_number, total_pages = int(parts[1]), int(parts[2])
+                    progress = 35 + int((page_number / max(total_pages, 1)) * 42)
+                    set_state(
+                        state,
+                        status="processing",
+                        step="Parsing",
+                        progress=min(progress, 78),
+                        message=f"Reading FOCA page {page_number} of {total_pages}.",
+                    )
+            elif line.startswith("ERROR: "):
+                user_error = line[len("ERROR: ") :]
+            elif line:
+                diagnostics.append(line)
+        returncode = proc.wait()
+    finally:
+        killer.cancel()
+
+    if timed_out.is_set():
+        raise ParseError("Parsing took too long and was stopped. Try a smaller export.")
+    if returncode == 3:
+        raise ParseError(user_error or GENERIC_PARSE_ERROR)
+    if returncode != 0:
+        logger.error("Parser subprocess failed (rc=%s): %s", returncode, " | ".join(diagnostics[-10:]))
+        raise RuntimeError(f"Parser subprocess exited with code {returncode}")
+
+
 def process_upload(session_id: str, token: str, pdf_path: Path, filename: str) -> None:
     state = get_or_create_session(session_id)
+    out_path = pdf_path.with_name(f"{token}.summary.tmp.json")
     try:
         set_state(state, status="processing", step="Parsing", progress=35, message="Reading FOCA tables and flight remarks.")
 
-        def update_parse_progress(page_number: int, total_pages: int) -> None:
-            progress = 35 + int((page_number / max(total_pages, 1)) * 42)
-            set_state(
-                state,
-                status="processing",
-                step="Parsing",
-                progress=min(progress, 78),
-                message=f"Reading FOCA page {page_number} of {total_pages}.",
-            )
-
-        summary = parse_pdf_to_summary(pdf_path, source_filename=filename, progress_callback=update_parse_progress)
+        run_parser_subprocess(state, pdf_path, out_path, filename)
+        summary = json.loads(out_path.read_text(encoding="utf-8"))
 
         set_state(state, status="processing", step="Building analytics", progress=82, message="Calculating routes, PIC XC, aircraft, and registrations.")
-        target_dir = session_dir(session_id)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        final_pdf = target_dir / "logbook.pdf"
-        pdf_path.replace(final_pdf)
         summary_path(session_id).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
 
         with state.lock:
@@ -280,18 +451,32 @@ def process_upload(session_id: str, token: str, pdf_path: Path, filename: str) -
             state.message = "Logbook processed for this browser session."
             state.updated_at = now()
     except Exception as exc:
-        try:
-            if pdf_path.exists():
-                pdf_path.unlink()
-        except Exception:
-            pass
+        if isinstance(exc, ParseError):
+            message = str(exc)
+            logger.info("Parse rejected for session upload: %s", message)
+        else:
+            message = GENERIC_PARSE_ERROR
+            logger.exception("Upload processing failed")
         with state.lock:
             if state.job_token == token:
                 state.status = "error"
                 state.step = "Error"
                 state.progress = 100
-                state.message = str(exc)
+                state.message = message
                 state.updated_at = now()
+    finally:
+        # Data minimization: only the derived summary is kept, never the PDF.
+        for path in (pdf_path, out_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # Drop the session dir if nothing was persisted so failed uploads
+        # do not count toward MAX_SESSIONS.
+        try:
+            pdf_path.parent.rmdir()
+        except OSError:
+            pass
 
 
 @app.post("/api/upload")
@@ -301,6 +486,10 @@ async def upload_logbook(request: Request, file: UploadFile = File(...)) -> JSON
     content_type = (file.content_type or "").lower()
     if not (filename.lower().endswith(".pdf") or content_type in {"application/pdf", "application/octet-stream"}):
         raise HTTPException(status_code=400, detail="Upload a PDF file.")
+
+    session_path = session_dir(state.session_id)
+    if not session_path.exists() and await asyncio.to_thread(count_session_dirs) >= MAX_SESSIONS:
+        raise HTTPException(status_code=429, detail="The server is at capacity. Try again later.")
 
     with state.lock:
         if state.status == "processing":
@@ -313,14 +502,14 @@ async def upload_logbook(request: Request, file: UploadFile = File(...)) -> JSON
         state.message = "Receiving PDF."
         state.updated_at = now()
 
-    target_dir = session_dir(state.session_id)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_dir / f"{token}.uploading.pdf"
+    session_path.mkdir(parents=True, exist_ok=True)
+    tmp_path = session_path / f"{token}.uploading.pdf"
 
     total = 0
     first_chunk = b""
     try:
-        with tmp_path.open("wb") as handle:
+        handle = await asyncio.to_thread(tmp_path.open, "wb")
+        try:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
@@ -330,7 +519,9 @@ async def upload_logbook(request: Request, file: UploadFile = File(...)) -> JSON
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail="PDF is larger than the configured upload limit.")
-                handle.write(chunk)
+                await asyncio.to_thread(handle.write, chunk)
+        finally:
+            await asyncio.to_thread(handle.close)
     except Exception:
         try:
             if tmp_path.exists():
