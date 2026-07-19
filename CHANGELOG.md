@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.3.0 - 2026-07-19
+
+Security and hardening release closing all findings from the 2026-07-18 audit (issues #17-#24).
+
+- Added an hourly session-cleanup task and eviction of stuck sessions; cleanup no longer runs only at startup.
+- Moved PDF parsing into an isolated subprocess with a hard `PARSE_TIMEOUT_SECONDS` limit (default 120 s).
+- Session cookies are now HMAC-signed so only server-issued session IDs are accepted, and set `Secure` behind HTTPS.
+- Added nginx rate limiting on uploads, a per-IP connection cap, and an app-side `MAX_SESSIONS` capacity guard.
+- Added security headers (CSP, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`) and Subresource Integrity hashes on CDN-loaded Leaflet assets.
+- Uploaded PDFs are deleted immediately after parsing; only the derived summary is retained, and parse errors no longer expose internal details.
+- Pinned `python:3.14-slim` and `nginx-unprivileged:1-alpine` base images and all GitHub Actions to commit SHAs.
+- Performance: non-blocking upload writes, cached HTML responses, faster parser line grouping.
+
+Note: existing browser sessions are re-issued cookies on first visit after upgrade (previous unsigned cookies are no longer honored).
+
 ## v1.2.0 - 2026-07-18
 
 - Updated all Python dependencies to their latest releases: `fastapi` 0.139.2, `uvicorn` 0.51.0, `PyMuPDF` 1.28.0, `pdfplumber` 0.11.10 (`airportsdata` 20260315 and `python-multipart` 0.0.32 already current).
